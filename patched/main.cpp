@@ -9,12 +9,24 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <base64.h>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <semaphore.h>
 #include "../../../../SDK/components/utilities/include/sample_log.h"
+#include "thread_safe_list.h"
 using namespace StackFlows;
+#ifdef ENABLE_BACKWARD
+#define BACKWARD_HAS_DW 1
+#include "backward.hpp"
+#include "backward.h"
+#endif
+
+#define MAX_TASK_NUM 2
 
 int main_exit_flage = 0;
 static void __sigint(int iSigNo)
@@ -34,9 +46,65 @@ typedef std::function<void(const std::string &data, bool finish)> task_callback_
     else if (obj.contains(#key))              \
         mode_config_.key = obj[#key];
 
+/**
+ * Soft prefix embedding container.
+ * - data_bf16 holds BF16 values as raw uint16 bit patterns (same format used in embed_selector outputs).
+ */
+struct SoftPrefixBF16 {
+    int len = 0;                     // P
+    std::vector<uint16_t> data_bf16; // P * H (H=tokens_embed_size)
+};
+
+struct InferJob {
+    std::string msg;    // user message (plain text after stream/base64 decode)
+    SoftPrefixBF16 sp;  // optional; sp.len==0 means no prefix
+};
+
+// Parse soft_prefix from a JSON frame (expected in stream finish frame).
+// soft_prefix: { "len": P, "data_b64": "..." } where data_b64 is BF16 bytes (little-endian u16) of length P*H*2.
+static bool parse_soft_prefix_from_frame_json(const std::string &frame_json, int embed_size_h, SoftPrefixBF16 &out)
+{
+    out.len = 0;
+    out.data_bf16.clear();
+
+    if (embed_size_h <= 0) return false;
+
+    auto j = nlohmann::json::parse(frame_json, nullptr, false);
+    if (j.is_discarded() || !j.contains("soft_prefix")) {
+        return false;
+    }
+    auto sp = j["soft_prefix"];
+    if (!sp.is_object()) return false;
+
+    int P = sp.value("len", 0);
+    std::string b64 = sp.value("data_b64", "");
+    if (P <= 0 || b64.empty()) return false;
+
+    std::string bin;
+    int ret = decode_base64(b64, bin); // existing util (same used elsewhere)
+    if (ret == -1) return false;
+
+    const size_t need = (size_t)P * (size_t)embed_size_h * sizeof(uint16_t);
+    if (bin.size() != need) {
+        SLOGE("soft_prefix size mismatch: got=%d need=%d (P=%d H=%d)", (int)bin.size(), (int)need, P, embed_size_h);
+        return false;
+    }
+
+    out.len = P;
+    out.data_bf16.resize((size_t)P * (size_t)embed_size_h);
+    std::memcpy(out.data_bf16.data(), bin.data(), need);
+    return true;
+}
+
 class llm_task {
 private:
+    static std::atomic<unsigned int> next_port_;
+    std::atomic_bool tokenizer_server_flage_;
+    unsigned int port_;
+    pid_t tokenizer_pid_ = -1;
+
 public:
+    enum inference_status { INFERENCE_NONE = 0, INFERENCE_RUNNING };
     LLMAttrType mode_config_;
     std::unique_ptr<LLM> lLaMa_;
     std::string model_;
@@ -46,8 +114,9 @@ public:
     task_callback_t out_callback_;
     bool enoutput_;
     bool enstream_;
-    std::atomic_bool tokenizer_server_flage_;
-    unsigned int port_ = 8080;
+
+    std::unique_ptr<std::thread> inference_run_;
+    thread_safe::list<InferJob> async_list_;
 
     void set_output(task_callback_t out_callback)
     {
@@ -94,6 +163,7 @@ public:
                     SLOGW("config file :%s miss", file_name.c_str());
                     continue;
                 }
+                SLOGI("config file :%s read", file_name.c_str());
                 config_file >> file_body;
                 config_file.close();
                 break;
@@ -123,6 +193,7 @@ public:
             CONFIG_AUTO_SET(file_body["mode_param"], top_p);
 
             if (mode_config_.filename_tokenizer_model.find("http:") != std::string::npos) {
+                mode_config_.filename_tokenizer_model = "http://localhost:" + std::to_string(port_);
                 std::string tokenizer_file;
                 if (file_exists(std::string("/opt/m5stack/scripts/") + model_ + std::string("_tokenizer.py"))) {
                     tokenizer_file = std::string("/opt/m5stack/scripts/") + model_ + std::string("_tokenizer.py");
@@ -137,16 +208,17 @@ public:
                     __log += " not found!";
                     SLOGE("%s", __log.c_str());
                 }
-                if (!tokenizer_server_flage_) {
-                    pid_t pid = fork();
-                    if (pid == 0) {
+                if (!tokenizer_server_flage_.load()) {
+                    tokenizer_pid_ = fork();
+                    if (tokenizer_pid_ == 0) {
+                        setenv("PYTHONPATH", "/opt/m5stack/lib/llm/site-packages", 1);
                         execl("/usr/bin/python3", "python3", tokenizer_file.c_str(), "--host", "localhost", "--port",
                               std::to_string(port_).c_str(), "--model_id", (base_model + "tokenizer").c_str(),
                               "--content", ("'" + prompt_ + "'").c_str(), nullptr);
                         perror("execl failed");
                         exit(1);
                     }
-                    tokenizer_server_flage_ = true;
+                    tokenizer_server_flage_.store(true);
                     SLOGI("port_=%s model_id=%s content=%s", std::to_string(port_).c_str(),
                           (base_model + "tokenizer").c_str(), ("'" + prompt_ + "'").c_str());
                     std::this_thread::sleep_for(std::chrono::seconds(15));
@@ -205,52 +277,125 @@ public:
         return oss_prompt.str();
     }
 
-    void inference(const std::string &msg)
+    void run()
+    {
+        InferJob par;
+        for (;;) {
+            par = async_list_.get();
+            if (par.msg.empty()) break;
+            inference(par);
+        }
+    }
+
+    int inference_async(const InferJob &job)
+    {
+        if (job.msg.empty()) return -1;
+        if (async_list_.size() < 3) {
+            InferJob par = job;
+            async_list_.put(par);
+        } else {
+            SLOGE("inference list is full\n");
+        }
+        return async_list_.size();
+    }
+
+    void inference(const InferJob &job)
     {
         try {
-            std::string out = lLaMa_->Run(prompt_complete(msg));
+            // Soft prefix is set per-job, then cleared to avoid leaking to the next request.
+            if (lLaMa_) {
+                if (job.sp.len > 0 && !job.sp.data_bf16.empty()) {
+                    lLaMa_->SetSoftPrefixBF16(job.sp.len, job.sp.data_bf16);
+                } else {
+                    lLaMa_->ClearSoftPrefix();
+                }
+            }
+
+            std::string out = lLaMa_->Run(prompt_complete(job.msg));
             if (out_callback_) out_callback_(out, true);
+
+            if (lLaMa_) lLaMa_->ClearSoftPrefix();
         } catch (...) {
             SLOGW("lLaMa_->Run have error!");
+            if (lLaMa_) lLaMa_->ClearSoftPrefix();
         }
     }
 
     bool pause()
     {
-        lLaMa_->Stop();
+        if (lLaMa_) lLaMa_->Stop();
         return true;
     }
 
     bool delete_model()
     {
+        if (tokenizer_pid_ != -1) {
+            kill(tokenizer_pid_, SIGTERM);
+            waitpid(tokenizer_pid_, nullptr, 0);
+            tokenizer_pid_ = -1;
+        }
         lLaMa_->Deinit();
         lLaMa_.reset();
         return true;
     }
 
-    llm_task(const std::string &workid)
+    static unsigned int getNextPort()
     {
+        unsigned int port = next_port_++;
+        if (port > 8089) {
+            next_port_ = 8080;
+            port       = 8080;
+        }
+        return port;
+    }
+
+    llm_task(const std::string &workid) : tokenizer_server_flage_(false), port_(getNextPort())
+    {
+        inference_run_ = std::make_unique<std::thread>(std::bind(&llm_task::run, this));
+    }
+
+    void start()
+    {
+        if (!inference_run_) {
+            inference_run_ = std::make_unique<std::thread>(std::bind(&llm_task::run, this));
+        }
+    }
+
+    void stop()
+    {
+        if (inference_run_) {
+            InferJob par; // empty msg => stop signal
+            async_list_.put(par);
+            if (lLaMa_) lLaMa_->Stop();
+            inference_run_->join();
+            inference_run_.reset();
+        }
     }
 
     ~llm_task()
     {
+        stop();
+        if (tokenizer_pid_ != -1) {
+            kill(tokenizer_pid_, SIGTERM);
+            waitpid(tokenizer_pid_, nullptr, WNOHANG);
+        }
         if (lLaMa_) {
             lLaMa_->Deinit();
         }
     }
 };
 
+std::atomic<unsigned int> llm_task::next_port_{8080};
+
 #undef CONFIG_AUTO_SET
 
 class llm_llm : public StackFlow {
 private:
-    int task_count_;
     std::unordered_map<int, std::shared_ptr<llm_task>> llm_task_;
 
 public:
     llm_llm() : StackFlow("llm")
     {
-        task_count_ = 2;
     }
 
     void task_output(const std::weak_ptr<llm_task> llm_task_obj_weak,
@@ -282,7 +427,7 @@ public:
     }
 
     void task_pause(const std::weak_ptr<llm_task> llm_task_obj_weak,
-                const std::weak_ptr<llm_channel_obj> llm_channel_weak)
+                    const std::weak_ptr<llm_channel_obj> llm_channel_weak)
     {
         auto llm_task_obj = llm_task_obj_weak.lock();
         auto llm_channel  = llm_channel_weak.lock();
@@ -350,7 +495,23 @@ public:
             }
             next_data = &tmp_msg2;
         }
-        llm_task_obj->inference((*next_data));
+
+        InferJob job;
+        job.msg = sample_unescapeString(*next_data);
+
+        // soft_prefix is expected on the final stream frame JSON (finish=true).
+        // For non-stream inputs, we ignore soft_prefix by default.
+        if (object.find("stream") != std::string::npos) {
+            // only try on finish frame to avoid needing to buffer soft_prefix across chunks
+            if (sample_json_str_get(data, "finish") == "true") {
+                SoftPrefixBF16 sp;
+                if (parse_soft_prefix_from_frame_json(data, llm_task_obj->mode_config_.tokens_embed_size, sp)) {
+                    job.sp = std::move(sp);
+                    SLOGI("soft_prefix accepted: P=%d H=%d", job.sp.len, llm_task_obj->mode_config_.tokens_embed_size);
+                }
+            }
+        }
+        llm_task_obj->inference_async(job);
     }
 
     void task_asr_data(const std::weak_ptr<llm_task> llm_task_obj_weak,
@@ -362,12 +523,16 @@ public:
         if (!(llm_task_obj && llm_channel)) {
             return;
         }
+
+        InferJob job;
         if (object.find("stream") != std::string::npos) {
             if (sample_json_str_get(data, "finish") == "true") {
-                llm_task_obj->inference(sample_json_str_get(data, "delta"));
+                job.msg = sample_json_str_get(data, "delta");
+                llm_task_obj->inference_async(job);
             }
         } else {
-            llm_task_obj->inference(data);
+            job.msg = data;
+            llm_task_obj->inference_async(job);
         }
     }
 
@@ -386,7 +551,7 @@ public:
     int setup(const std::string &work_id, const std::string &object, const std::string &data) override
     {
         nlohmann::json error_body;
-        if ((llm_task_channel_.size() - 1) == task_count_) {
+        if ((llm_task_channel_.size() - 1) == MAX_TASK_NUM) {
             error_body["code"]    = -21;
             error_body["message"] = "task full";
             send("None", "None", error_body, "llm");
@@ -549,6 +714,7 @@ public:
             send("None", "None", error_body, work_id);
             return -1;
         }
+        llm_task_[work_id_num]->stop();
         auto llm_channel = get_channel(work_id_num);
         llm_channel->stop_subscriber("");
         llm_task_.erase(work_id_num);
@@ -563,6 +729,7 @@ public:
             if (iteam == llm_task_.end()) {
                 break;
             }
+            iteam->second->stop();
             get_channel(iteam->first)->stop_subscriber("");
             iteam->second.reset();
             llm_task_.erase(iteam->first);
