@@ -1,6 +1,6 @@
 # BI_M5_QwenSoftPrefix
 
-LLM推論フレームワーク [StackFlow](https://github.com/DakeQQ/StackFlow) をベースとした、Qwen2.5モデルのSoft Prefix実装です。
+LLM推論フレームワーク [StackFlow](https://github.com/DakeQQ/StackFlow) をベースとした、Qwen2.5モデルのSoft Prefix実装
 
 ## 目次
 
@@ -31,7 +31,7 @@ git submodule update --init --recursive
 
 ## ビルド
 
-メモリ不足を回避するため、並列ビルドを無効化（`-j1`）することを推奨します。
+メモリ不足を回避するため、並列ビルドを無効化（`-j1`）することを推奨
 
 ```bash
 scons -j1
@@ -48,7 +48,7 @@ KeyError: 'GCC_DUMPMACHINE':
     gcc_dumpmachine = env["GCC_DUMPMACHINE"].split("-")
 ```
 
-**解決方法**: 以下のパッチスクリプトを実行して、`GCC_DUMPMACHINE`環境変数を自動設定します。
+**解決方法**: 以下のパッチスクリプトを実行して、`GCC_DUMPMACHINE`環境変数を自動設定
 
 ```bash
 python3 - <<'PY'
@@ -108,7 +108,7 @@ sh: /opt/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-lin
 scons: *** [build/Backward_cpp/empty_src_file.cpp.o] Error 127
 ```
 
-**解決方法**: ネイティブコンパイラへのラッパースクリプトを作成します。
+**解決方法**: ネイティブコンパイラへのラッパースクリプトを作成
 
 ```bash
 set -e
@@ -161,6 +161,6 @@ echo "Wrappers installed in $TC"
 scons: *** [build/llm_kws/llm_kws] Error 1
 ```
 
-**原因**: 静的ライブラリが `-fPIC` フラグなしでコンパイルされています。
+**原因**: 静的ライブラリが `-fPIC` フラグなしでコンパイルされている。
 
-**解決方法**: ビルド設定を確認し、必要に応じて依存ライブラリを `-fPIC` フラグ付きで再ビルドしてください。
+**解決方法**: ビルド設定を確認し、必要に応じて依存ライブラリを `-fPIC` フラグ付きで再ビルド。
